@@ -153,21 +153,35 @@ fn split_node_attr(attr: Option<Dictionary>) -> (Option<Dictionary>, Option<Dict
         None => (None, None),
         Some(mut attr) if current_format_version() >= 4 => {
             let hoi = attr.remove("hoi").and_then(|p| p.expect_dict().ok());
-            let user_data = attr.remove("userData").and_then(|p| p.expect_dict().ok());
-            (user_data, hoi)
+            let mut user_data = attr
+                .remove("userData")
+                .and_then(|p| p.expect_dict().ok())
+                .unwrap_or_default();
+            // The node's name (and anything else besides `hoi` and
+            // `userData`) is in the user data in version 3.
+            user_data.extend(attr);
+            ((!user_data.is_empty()).then_some(user_data), hoi)
         }
         Some(attr) => (Some(attr), None),
     }
 }
 
 /// Folds `user_data` and `hoi` back into a version 4 `nodeAttr` dictionary.
+/// Glyphs 4 writes a node's name as `name` in the `nodeAttr` object, not
+/// in its user data, where version 3 has it.
 fn build_node_attr(user_data: &Option<Dictionary>, hoi: &Option<Dictionary>) -> Dictionary {
     let mut attr = Dictionary::new();
     if let Some(hoi) = hoi {
         attr.insert("hoi".into(), Plist::Dictionary(hoi.clone()));
     }
     if let Some(user_data) = user_data {
-        attr.insert("userData".into(), Plist::Dictionary(user_data.clone()));
+        let mut user_data = user_data.clone();
+        if let Some(name) = user_data.remove("name") {
+            attr.insert("name".into(), name);
+        }
+        if !user_data.is_empty() {
+            attr.insert("userData".into(), Plist::Dictionary(user_data));
+        }
     }
     attr
 }
@@ -370,7 +384,7 @@ impl Serialize for glyphs3::Layer {
         if let Some(vert_width) = &self.vert_width {
             seq.serialize_field("vertWidth", vert_width)?;
         }
-        if !self.visible {
+        if self.visible {
             seq.serialize_field("visible", &self.visible)?;
         }
         if self.width != 0.0 || !self.layer_id.is_empty() {
@@ -384,8 +398,65 @@ pub(crate) fn int_to_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let s: i8 = Deserialize::deserialize(deserializer)?;
-    Ok(s == 1)
+    deserializer.deserialize_any(IntToBoolVisitor)
+}
+
+/// A boolean written as `1`/`0`, as Glyphs does, or as `:true`/`:false`,
+/// as Glyphs 4.1.1 writes some settings.
+struct IntToBoolVisitor;
+
+impl<'de> Visitor<'de> for IntToBoolVisitor {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("1, 0, :true or :false")
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(v == 1)
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(v == 1)
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(v == 1.0)
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(v)
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        match v.trim_start_matches(':') {
+            "1" | "true" | "YES" => Ok(true),
+            "0" | "false" | "NO" => Ok(false),
+            other => Err(E::invalid_value(serde::de::Unexpected::Str(other), &self)),
+        }
+    }
+}
+
+pub(crate) fn optional_int_to_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    int_to_bool(deserializer).map(Some)
 }
 
 pub(crate) fn anything_to_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>

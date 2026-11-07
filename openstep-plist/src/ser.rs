@@ -12,6 +12,9 @@ pub struct Serializer {
     seq_stack: Vec<SeqState>,
     // Track nesting of maps to append trailing semicolon for top-level map
     map_depth: usize,
+    // Follow every element of a block array with a comma, the last one too,
+    // as Glyphs 4 does.
+    trailing_commas: bool,
 }
 
 struct SeqState {
@@ -28,9 +31,26 @@ macro_rules! forward_to {
     };
 }
 
-const FLOAT_PRECISION: i32 = 4;
+/// Decimal places kept for f64 values, as many as Glyphs writes (`0.633333`).
+const FLOAT_PRECISION: i32 = 6;
 
 pub fn to_string<T>(value: &T) -> Result<String>
+where
+    T: Serialize,
+{
+    serialize(value, false)
+}
+
+/// Like [`to_string`], but every element of an array written one per line
+/// is followed by a comma, the last one too, as in Glyphs 4 files.
+pub fn to_string_with_trailing_commas<T>(value: &T) -> Result<String>
+where
+    T: Serialize,
+{
+    serialize(value, true)
+}
+
+fn serialize<T>(value: &T, trailing_commas: bool) -> Result<String>
 where
     T: Serialize,
 {
@@ -38,6 +58,7 @@ where
         output: Vec::new(),
         seq_stack: Vec::new(),
         map_depth: 0,
+        trailing_commas,
     };
     value.serialize(&mut serializer)?;
     Ok(serializer.output.join(""))
@@ -76,12 +97,17 @@ impl ser::Serializer for &mut Serializer {
         Ok(())
     }
 
-    forward_to!(serialize_f32, f32, serialize_f64, f64::from);
+    fn serialize_f32(self, v: f32) -> Result<()> {
+        // The shortest form that reads back as the same f32. Widening to f64
+        // first would expose binary noise (0.23864 -> 0.2386399...).
+        self.output.push(SmolStr::new(format!("{}", v + 0.0)));
+        Ok(())
+    }
 
     fn serialize_f64(self, v: f64) -> Result<()> {
         self.output.push(SmolStr::new(format!(
             "{}",
-            (v * 10_f64.powi(FLOAT_PRECISION)).round() / 10_f64.powi(FLOAT_PRECISION)
+            (v * 10_f64.powi(FLOAT_PRECISION)).round() / 10_f64.powi(FLOAT_PRECISION) + 0.0
         )));
         Ok(())
     }
@@ -240,6 +266,7 @@ impl ser::SerializeSeq for &mut Serializer {
             output: Vec::new(),
             seq_stack: Vec::new(),
             map_depth: 0,
+            trailing_commas: self.trailing_commas,
         };
         value.serialize(&mut tmp)?;
         // Determine if element is complex (starts with map or sequence)
@@ -270,7 +297,11 @@ impl ser::SerializeSeq for &mut Serializer {
     // Close the sequence.
     fn end(self) -> Result<()> {
         if let Some(state) = self.seq_stack.pop() {
-            if state.all_simple {
+            if state.elements.is_empty() {
+                // Glyphs writes an empty array across two lines.
+                self.output.push(SmolStr::new_static("(\n"));
+                self.output.push(SmolStr::new_static(")"));
+            } else if state.all_simple {
                 // Inline formatting: (a,b,c) or (a, b, c) depending on type
                 self.output.push(SmolStr::new_static("("));
                 for (i, elem) in state.elements.iter().enumerate() {
@@ -298,6 +329,9 @@ impl ser::SerializeSeq for &mut Serializer {
                     for tok in elem {
                         self.output.push(tok.clone());
                     }
+                }
+                if self.trailing_commas {
+                    self.output.push(SmolStr::new_static(","));
                 }
                 self.output.push(SmolStr::new_static("\n)"));
             }
@@ -520,6 +554,21 @@ mod tests {
         .into();
         let s = to_string(&plist).unwrap();
         assert_eq!(s, r#"(hello, world)"#);
+    }
+
+    #[test]
+    fn floats_keep_their_written_precision() {
+        assert_eq!(to_string(&0.23864_f32).unwrap(), "0.23864");
+        assert_eq!(to_string(&-0.0_f32).unwrap(), "0");
+        assert_eq!(to_string(&0.633333_f64).unwrap(), "0.633333");
+        assert_eq!(to_string(&(0.1_f64 + 0.2)).unwrap(), "0.3");
+    }
+
+    #[test]
+    fn empty_array_spans_two_lines() {
+        let plist_str = "{\nvalue = (\n);\n}";
+        let plist: Plist = Plist::parse(plist_str).unwrap();
+        assert_eq!(to_string(&plist).unwrap(), plist_str);
     }
 
     #[test]

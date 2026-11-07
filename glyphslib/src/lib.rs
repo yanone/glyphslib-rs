@@ -128,7 +128,11 @@ mod serde;
 mod traits;
 mod upgrade;
 mod utils;
-use std::{collections::HashMap, ffi::OsStr, fs, path};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    ffi::OsStr,
+    fs, path,
+};
 
 pub use traits::GlyphsFile;
 
@@ -140,12 +144,13 @@ use openstep_plist::{de::Deserializer, Dictionary};
 use crate::common::{Feature, FeatureClass, FeaturePrefix};
 use utils::user_name_to_file_name;
 
-/// Adds the feature prefixes, classes and features stored as `features/*.fea`
-/// files in a Glyphs 4 package to the loaded font.
+/// Adds the code of the feature prefixes, classes and features stored as
+/// `features/*.fea` files in a Glyphs 4 package to the loaded font.
 ///
-/// File names follow the package naming rules: prefixes are prefixed with `_`,
-/// classes with `@`, and features use their tag. A trailing `.2`, `.3`, ...
-/// deduplication suffix is stripped.
+/// Entries `fontinfo.plist` lists without their code get it from the file
+/// [`package_feature_files`] names for them, which keeps their order and
+/// flags. A file no entry claims becomes a new prefix (`_` before the name),
+/// class (`@`) or feature (its tag), in file name order.
 fn load_package_features(entries: &HashMap<String, String>, font: &mut Glyphs3) {
     let mut files: Vec<(&str, &str)> = entries
         .iter()
@@ -159,13 +164,32 @@ fn load_package_features(entries: &HashMap<String, String>, font: &mut Glyphs3) 
         .collect();
     files.sort_by(|a, b| a.0.cmp(b.0));
 
+    let mut claimed = HashSet::new();
+    for (kind, index, path) in package_feature_files(font) {
+        // Glyphs 4 names each entry's file; older packages leave it to the
+        // naming rules.
+        let Some(code) = entries.get(&path) else {
+            continue;
+        };
+        claimed.insert(path.trim_start_matches("features/").to_string());
+        match kind {
+            PackageFeatureKind::Prefix => font.feature_prefixes[index].code = code.clone(),
+            PackageFeatureKind::Class => font.classes[index].code = code.clone(),
+            PackageFeatureKind::Feature => font.features[index].code = code.clone(),
+        }
+    }
+
     for (file_name, code) in files {
+        if claimed.contains(file_name) {
+            continue;
+        }
         let stem = strip_feature_file_suffix(file_name.trim_end_matches(".fea"));
         if let Some(name) = stem.strip_prefix('_') {
             font.feature_prefixes.push(FeaturePrefix {
                 automatic: false,
                 code: code.to_string(),
                 disabled: false,
+                file: Some(file_name.to_string()),
                 name: name.to_string(),
                 notes: None,
             });
@@ -174,6 +198,7 @@ fn load_package_features(entries: &HashMap<String, String>, font: &mut Glyphs3) 
                 automatic: false,
                 code: code.to_string(),
                 disabled: false,
+                file: Some(file_name.to_string()),
                 name: name.to_string(),
                 notes: None,
             });
@@ -182,12 +207,77 @@ fn load_package_features(entries: &HashMap<String, String>, font: &mut Glyphs3) 
                 automatic: false,
                 code: code.to_string(),
                 disabled: false,
+                file: Some(file_name.to_string()),
                 labels: Vec::new(),
                 notes: None,
                 tag: stem.to_string(),
             });
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PackageFeatureKind {
+    Prefix,
+    Class,
+    Feature,
+}
+
+/// The `features/*.fea` file of every feature prefix, class and feature of a
+/// Glyphs 4 package, by its position in the font's lists: `_` before a
+/// prefix's name, `@` before a class's, a feature's tag, and `.2`, `.3`, ...
+/// after a stem an earlier file already has.
+fn package_feature_files(font: &Glyphs3) -> Vec<(PackageFeatureKind, usize, String)> {
+    let stems = font
+        .feature_prefixes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                PackageFeatureKind::Prefix,
+                i,
+                format!("_{}", p.name),
+                &p.file,
+            )
+        })
+        .chain(font.classes.iter().enumerate().map(|(i, c)| {
+            (
+                PackageFeatureKind::Class,
+                i,
+                format!("@{}", c.name),
+                &c.file,
+            )
+        }))
+        .chain(
+            font.features
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (PackageFeatureKind::Feature, i, f.tag.clone(), &f.file)),
+        );
+    let mut taken = HashSet::new();
+    let mut files = vec![];
+    for (kind, index, stem, file) in stems {
+        // Keep the file an entry already names, as long as no earlier entry
+        // has it.
+        if let Some(file) = file.as_deref().filter(|f| {
+            f.ends_with(".fea") && !f.contains(['/', '\\']) && !taken.contains(&f.to_lowercase())
+        }) {
+            taken.insert(file.to_lowercase());
+            files.push((kind, index, format!("features/{file}")));
+            continue;
+        }
+        // A path separator cannot be part of a file name.
+        let stem = stem.replace(['/', '\\'], "_");
+        let mut candidate = stem.clone();
+        let mut counter = 1;
+        // Compared case-insensitively, as on the file systems Glyphs runs on.
+        while !taken.insert(format!("{candidate}.fea").to_lowercase()) {
+            counter += 1;
+            candidate = format!("{stem}.{counter}");
+        }
+        files.push((kind, index, format!("features/{candidate}.fea")));
+    }
+    files
 }
 
 /// Strips a trailing `.2`, `.3`, ... deduplication suffix from a feature file
@@ -356,7 +446,8 @@ impl Font {
         if format_version(&plist) >= 3 {
             // `Color` needs the file format version while (de)serializing.
             let _guard = common::with_format_version(format_version(&plist));
-            let glyphs3: Glyphs3 = serde_path_to_error::deserialize(deserializer)?;
+            let mut glyphs3: Glyphs3 = serde_path_to_error::deserialize(deserializer)?;
+            glyphs3.names_from_properties();
             Ok(Font::Glyphs3(glyphs3))
         } else {
             let glyphs2: Glyphs2 = serde_path_to_error::deserialize(deserializer)?;
@@ -425,7 +516,13 @@ impl Font {
             // `glyphs3.format_version.into()`.
             Font::Glyphs3(glyphs3) => {
                 let _guard = common::with_format_version(glyphs3.format_version as u8);
-                openstep_plist::ser::to_string(glyphs3)
+                if glyphs3.format_version >= 4 {
+                    let mut glyphs4 = glyphs3.clone();
+                    glyphs4.names_into_properties();
+                    common::plist_string(&glyphs4)
+                } else {
+                    common::plist_string(glyphs3)
+                }
             }
         }
     }
@@ -492,52 +589,213 @@ impl Font {
     }
 
     fn save_package(&self, glyphs_file: &path::Path) -> Result<(), Box<dyn std::error::Error>> {
-        if let Font::Glyphs3(glyphs3) = self {
-            let glyphs_dir = glyphs_file.join("glyphs");
-            fs::create_dir_all(&glyphs_dir)?;
-            let mut glyph_order: Vec<Plist> = vec![];
-            for glyph in &glyphs3.glyphs {
-                glyph_order.push(Plist::String(glyph.name.clone()));
-                let name = user_name_to_file_name(&glyph.name);
-                let glyph_file = glyphs_dir.join(format!("{name}.glyph"));
-                fs::write(glyph_file, openstep_plist::ser::to_string(glyph)?)?;
+        for (relative_path, contents) in self.to_package_entries()? {
+            let file = glyphs_file.join(relative_path);
+            if let Some(parent) = file.parent() {
+                fs::create_dir_all(parent)?;
             }
-            let glyphorder_file = glyphs_file.join("order.plist");
-            fs::write(
-                glyphorder_file,
-                openstep_plist::ser::to_string(&glyph_order)?.trim(),
-            )?;
-            if !glyphs3.display_strings.is_empty() {
-                let mut dict = Dictionary::new();
-                dict.insert(
-                    "displayStrings".into(), // In a UIState.plist this has a lowercase 'd'
-                    Plist::Array(
-                        glyphs3
-                            .display_strings
-                            .iter()
-                            .map(|s| Plist::String(s.to_string()))
-                            .collect(),
-                    ),
-                );
-                let ui_state = Plist::Dictionary(dict);
-                fs::write(
-                    glyphs_file.join("UIState.plist"),
-                    openstep_plist::ser::to_string(&ui_state)?,
-                )?;
-            }
-            // Drop the glyphs and UI state now we have saved them.
-            let mut toplevel = glyphs3.clone();
-            toplevel.glyphs.clear();
-            toplevel.display_strings.clear();
-            fs::write(
-                glyphs_file.join("fontinfo.plist"),
-                openstep_plist::ser::to_string(&toplevel)?,
-            )?;
-            Ok(())
+            fs::write(file, contents)?;
+        }
+        Ok(())
+    }
+
+    /// Serializes the font as `.glyphspackage` file entries, keyed by path
+    /// relative to the package root: `fontinfo.plist`, `order.plist`,
+    /// `UIState.plist` (only with display strings) and
+    /// `glyphs/<glyph-file-name>.glyph` per glyph.
+    ///
+    /// This is the in-memory counterpart of [`Font::load_package_entries`]
+    /// and writes nothing to disk. Only Glyphs 3 packages can be written;
+    /// Glyphs 2 has no package format, and Glyphs 4 packages, which keep
+    /// kerning, features and the note in separate files, are not supported yet.
+    pub fn to_package_entries(
+        &self,
+    ) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+        let glyphs3 = self.package_glyphs3()?;
+        let _guard = common::with_format_version(glyphs3.format_version as u8);
+        let mut entries = BTreeMap::new();
+        for glyph in &glyphs3.glyphs {
+            entries.insert(
+                package_glyph_path(&glyph.name),
+                format!(
+                    "{}\n",
+                    common::plist_string(&package_glyph(glyph))?.trim_end()
+                ),
+            );
+        }
+        let names: Vec<&str> = glyphs3.glyphs.iter().map(|g| g.name.as_str()).collect();
+        entries.insert(
+            "order.plist".to_string(),
+            // Unlike the other files, Glyphs ends order.plist without a newline.
+            string_array_one_per_line(&names, glyphs3.format_version >= 4)?,
+        );
+        if !glyphs3.display_strings.is_empty() {
+            let mut dict = Dictionary::new();
+            // A UIState.plist spells this key with a lowercase 'd'.
+            dict.insert(
+                "displayStrings".into(),
+                Plist::Array(
+                    glyphs3
+                        .display_strings
+                        .iter()
+                        .map(|s| Plist::String(s.to_string()))
+                        .collect(),
+                ),
+            );
+            entries.insert(
+                "UIState.plist".to_string(),
+                format!(
+                    "{}\n",
+                    common::plist_string(&Plist::Dictionary(dict))?.trim_end()
+                ),
+            );
+        }
+        let mut toplevel = glyphs3.clone();
+        toplevel.glyphs.clear();
+        toplevel.display_strings.clear();
+        let fontinfo = if glyphs3.format_version >= 4 {
+            toplevel.names_into_properties();
+            Self::split_glyphs4_package(&mut toplevel, &mut entries)?;
+            let _code_in_files = common::PackageFeatureFilesGuard::new();
+            common::plist_string(&toplevel)?
         } else {
-            Err("Saving Glyphs2 as package is not supported".into())
+            common::plist_string(&toplevel)?
+        };
+        entries.insert(
+            "fontinfo.plist".to_string(),
+            format!("{}\n", fontinfo.trim_end()),
+        );
+        Ok(entries)
+    }
+
+    /// Serializes one glyph as its `.glyphspackage` file, returning the path
+    /// relative to the package root and the file contents, exactly as
+    /// [`Font::to_package_entries`] writes it. `None` if there is no glyph of
+    /// that name.
+    pub fn package_glyph_entry(
+        &self,
+        glyph_name: &str,
+    ) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
+        let glyphs3 = self.package_glyphs3()?;
+        let Some(glyph) = glyphs3.glyphs.iter().find(|g| g.name == glyph_name) else {
+            return Ok(None);
+        };
+        let _guard = common::with_format_version(glyphs3.format_version as u8);
+        Ok(Some((
+            package_glyph_path(&glyph.name),
+            format!(
+                "{}\n",
+                common::plist_string(&package_glyph(glyph))?.trim_end()
+            ),
+        )))
+    }
+
+    /// Moves what a Glyphs 4 package keeps in files of its own out of the
+    /// font: the kerning into `kerning.plist`, the note into `note.md` and the
+    /// code of feature prefixes, classes and features into `features/*.fea`.
+    fn split_glyphs4_package(
+        toplevel: &mut Glyphs3,
+        entries: &mut BTreeMap<String, String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[derive(::serde::Serialize)]
+        struct PackageKerning<'a> {
+            #[serde(rename = "kerningContext", skip_serializing_if = "BTreeMap::is_empty")]
+            context: &'a common::KerningContext,
+            #[serde(rename = "kerningLTR", skip_serializing_if = "BTreeMap::is_empty")]
+            ltr: &'a common::Kerning,
+            #[serde(rename = "kerningRTL", skip_serializing_if = "BTreeMap::is_empty")]
+            rtl: &'a common::Kerning,
+            #[serde(rename = "kerningVertical", skip_serializing_if = "BTreeMap::is_empty")]
+            vertical: &'a common::Kerning,
+        }
+        if !(toplevel.kerning.is_empty()
+            && toplevel.kerning_rtl.is_empty()
+            && toplevel.kerning_vertical.is_empty()
+            && toplevel.kerning_context.is_empty())
+        {
+            let kerning = PackageKerning {
+                context: &toplevel.kerning_context,
+                ltr: &toplevel.kerning,
+                rtl: &toplevel.kerning_rtl,
+                vertical: &toplevel.kerning_vertical,
+            };
+            entries.insert(
+                "kerning.plist".to_string(),
+                format!("{}\n", common::plist_string(&kerning)?.trim_end()),
+            );
+        }
+        toplevel.kerning.clear();
+        toplevel.kerning_rtl.clear();
+        toplevel.kerning_vertical.clear();
+        toplevel.kerning_context.clear();
+        if !toplevel.note.is_empty() {
+            entries.insert("note.md".to_string(), std::mem::take(&mut toplevel.note));
+        }
+        for (kind, index, path) in package_feature_files(toplevel) {
+            let (code, file) = match kind {
+                PackageFeatureKind::Prefix => {
+                    let p = &mut toplevel.feature_prefixes[index];
+                    (&p.code, &mut p.file)
+                }
+                PackageFeatureKind::Class => {
+                    let c = &mut toplevel.classes[index];
+                    (&c.code, &mut c.file)
+                }
+                PackageFeatureKind::Feature => {
+                    let f = &mut toplevel.features[index];
+                    (&f.code, &mut f.file)
+                }
+            };
+            *file = Some(path.trim_start_matches("features/").to_string());
+            entries.insert(path, code.clone());
+        }
+        Ok(())
+    }
+
+    fn package_glyphs3(&self) -> Result<&Glyphs3, Box<dyn std::error::Error>> {
+        match self {
+            Font::Glyphs3(glyphs3) => Ok(glyphs3),
+            Font::Glyphs2(_) => Err("Glyphs 2 files cannot be saved as a glyphspackage".into()),
         }
     }
+}
+
+/// Writes an array of strings one element per line, as Glyphs does for the
+/// package's `order.plist`; the serializer would put simple values inline.
+/// Glyphs 4 follows the last element with a comma too.
+fn string_array_one_per_line(
+    items: &[&str],
+    trailing_comma: bool,
+) -> Result<String, openstep_plist::error::Error> {
+    let mut out = String::from("(\n");
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&openstep_plist::ser::to_string(&Plist::String(
+            item.to_string(),
+        ))?);
+    }
+    if trailing_comma && !items.is_empty() {
+        out.push(',');
+    }
+    out.push_str("\n)");
+    Ok(out)
+}
+
+/// A glyph as Glyphs writes it into a package: without the time of its last
+/// change, which would make every save touch the file.
+fn package_glyph(glyph: &glyphs3::Glyph) -> glyphs3::Glyph {
+    glyphs3::Glyph {
+        last_change: None,
+        ..glyph.clone()
+    }
+}
+
+/// The path of a glyph's file inside a `.glyphspackage`, relative to the
+/// package root, e.g. `glyphs/A_.glyph` for `A`.
+pub fn package_glyph_path(glyph_name: &str) -> String {
+    format!("glyphs/{}.glyph", user_name_to_file_name(glyph_name))
 }
 
 #[cfg(test)]
@@ -635,9 +893,8 @@ mod tests {
     }
 
     #[test]
-    fn test_anchor_attr_is_renamed_by_version() {
-        // Glyphs 3 stores the user data under `userData`; both keys load into the
-        // single `attr` field.
+    fn test_anchor_user_data_moves_into_attr_for_v4() {
+        // Glyphs 3 writes the user data under `userData`, after the other keys.
         let plist = Plist::parse(r#"{ name = top; userData = { foo = bar; }; }"#).unwrap();
         let anchor: glyphs3::Anchor = {
             let _guard = crate::common::with_format_version(3);
@@ -646,36 +903,33 @@ mod tests {
         };
         assert_eq!(anchor.attr.get("foo").and_then(|v| v.as_str()), Some("bar"));
 
-        // ... and it also reads the Glyphs 4 `attr` key.
-        let plist4 = Plist::parse(r#"{ name = top; attr = { foo = bar; }; }"#).unwrap();
+        // Glyphs 4 writes it inside `attr`, as Glyphs 4.1 does.
+        let plist4 =
+            Plist::parse(r#"{ attr = { userData = { foo = bar; }; }; name = top; }"#).unwrap();
         let anchor4: glyphs3::Anchor = {
             let _guard = crate::common::with_format_version(4);
             let d = &mut Deserializer::from_plist(&plist4);
             serde_path_to_error::deserialize(d).unwrap()
         };
-        assert_eq!(
-            anchor4.attr.get("foo").and_then(|v| v.as_str()),
-            Some("bar")
-        );
+        assert_eq!(anchor4, anchor);
 
-        // v3 output uses `userData`; v4 output uses `attr`.
         let v3 = {
             let _guard = crate::common::with_format_version(3);
             openstep_plist::ser::to_string(&anchor).unwrap()
         };
-        assert!(v3.contains("userData"), "got {v3}");
-        assert!(!v3.contains("attr"), "got {v3}");
-
+        assert_eq!(v3, "{\nname = top;\nuserData = {\nfoo = bar;\n};\n}");
         let v4 = {
             let _guard = crate::common::with_format_version(4);
             openstep_plist::ser::to_string(&anchor).unwrap()
         };
-        assert!(v4.contains("attr"), "got {v4}");
-        assert!(!v4.contains("userData"), "got {v4}");
+        assert_eq!(
+            v4,
+            "{\nattr = {\nuserData = {\nfoo = bar;\n};\n};\nname = top;\n}"
+        );
     }
 
     #[test]
-    fn test_component_user_data_folds_into_attr_for_v4() {
+    fn test_component_user_data_moves_into_attr_for_v4() {
         let plist =
             Plist::parse(r#"{ ref = A; attr = { fill = 1; }; userData = { foo = bar; }; }"#)
                 .unwrap();
@@ -690,18 +944,25 @@ mod tests {
             let _guard = crate::common::with_format_version(3);
             openstep_plist::ser::to_string(&component).unwrap()
         };
-        assert!(v3.contains("attr"), "got {v3}");
-        assert!(v3.contains("userData"), "got {v3}");
+        assert!(v3.contains("attr = {\nfill = 1;\n};"), "got {v3}");
+        assert!(v3.contains("userData = {\nfoo = bar;\n};"), "got {v3}");
 
-        // v4 folds the user data into `attr`.
+        // v4 writes the user data inside `attr`, and reads it back from there.
         let v4 = {
             let _guard = crate::common::with_format_version(4);
             openstep_plist::ser::to_string(&component).unwrap()
         };
-        assert!(v4.contains("attr"), "got {v4}");
-        assert!(v4.contains("fill"), "got {v4}");
-        assert!(v4.contains("foo"), "got {v4}");
-        assert!(!v4.contains("userData"), "got {v4}");
+        assert!(
+            v4.contains("attr = {\nfill = 1;\nuserData = {\nfoo = bar;\n};\n};"),
+            "got {v4}"
+        );
+        let back: glyphs3::Component = {
+            let _guard = crate::common::with_format_version(4);
+            let plist = Plist::parse(&v4).unwrap();
+            let d = &mut Deserializer::from_plist(&plist);
+            serde_path_to_error::deserialize(d).unwrap()
+        };
+        assert_eq!(back, component);
     }
 
     #[test]
@@ -1009,5 +1270,263 @@ mod tests {
         let serialised = font.to_string().unwrap();
         let new_plist = Plist::parse(&serialised).unwrap();
         pretty_assertions::assert_eq!(plist, new_plist);
+    }
+}
+
+#[cfg(test)]
+mod package_entry_tests {
+    use super::*;
+
+    fn read_package(root: &path::Path) -> HashMap<String, String> {
+        let mut entries = HashMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let relative = path.strip_prefix(root).unwrap().to_string_lossy();
+                    entries.insert(
+                        relative.replace('\\', "/"),
+                        fs::read_to_string(&path).unwrap(),
+                    );
+                }
+            }
+        }
+        entries
+    }
+
+    #[test]
+    fn package_entries_reproduce_a_glyphs_written_package() {
+        let root = path::Path::new("resources/packages/YanoneKaffeesatz.glyphspackage");
+        let original = read_package(root);
+        let font = Font::load_package_entries(&original).unwrap();
+        let written = font.to_package_entries().unwrap();
+
+        let mut written_paths: Vec<&String> = written.keys().collect();
+        let mut original_paths: Vec<&String> = original.keys().collect();
+        written_paths.sort();
+        original_paths.sort();
+        assert_eq!(written_paths, original_paths);
+        // Glyph files and the glyph order come out byte for byte as Glyphs
+        // wrote them. fontinfo.plist only differs in how the master value
+        // arrays are wrapped: the serializer inlines arrays of numbers, Glyphs
+        // puts these on separate lines.
+        for (path, contents) in &written {
+            if path == "fontinfo.plist" {
+                let original_lines: std::collections::HashSet<&str> =
+                    original[path].lines().collect();
+                let extra: Vec<&str> = contents
+                    .lines()
+                    .filter(|l| !original_lines.contains(l))
+                    .collect();
+                assert!(
+                    extra
+                        .iter()
+                        .all(|l| l.starts_with("axesValues = (") || l.starts_with("stemValues = (")),
+                    "unexpected fontinfo.plist differences: {extra:?}"
+                );
+            } else {
+                assert_eq!(contents, &original[path], "{path} differs");
+            }
+        }
+        assert_eq!(
+            Font::load_package_entries(&written.into_iter().collect()).unwrap(),
+            font
+        );
+    }
+
+    #[test]
+    fn package_glyph_entry_matches_the_full_package() {
+        let root = path::Path::new("resources/packages/YanoneKaffeesatz.glyphspackage");
+        let font = Font::load_package_entries(&read_package(root)).unwrap();
+        let written = font.to_package_entries().unwrap();
+        let (path, contents) = font.package_glyph_entry("A").unwrap().unwrap();
+        assert_eq!(path, "glyphs/A_.glyph");
+        assert_eq!(&contents, &written[&path]);
+        assert!(font.package_glyph_entry("no-such-glyph").unwrap().is_none());
+    }
+
+    #[test]
+    fn layer_visibility_round_trips() {
+        let root = path::Path::new("resources/packages/YanoneKaffeesatz.glyphspackage");
+        let original = read_package(root);
+        let glyph_file = &original["glyphs/E_f-cy.loclB_G_R_.glyph"];
+        assert!(glyph_file.contains("visible = 1;"));
+        let font = Font::load_package_entries(&original).unwrap();
+        let glyph = &font.as_glyphs3().unwrap().glyphs;
+        let ef = glyph.iter().find(|g| g.name == "Ef-cy.loclBGR").unwrap();
+        assert!(ef.layers.iter().any(|l| l.visible));
+        assert!(ef.layers.iter().any(|l| !l.visible));
+    }
+
+    /// The example package as a Glyphs 4 font, with the things a Glyphs 4
+    /// package keeps in files of their own.
+    fn glyphs4_font() -> Font {
+        let root = path::Path::new("resources/packages/YanoneKaffeesatz.glyphspackage");
+        let Font::Glyphs3(mut glyphs3) = Font::load_package_entries(&read_package(root)).unwrap()
+        else {
+            panic!("not a Glyphs 3 font");
+        };
+        glyphs3.format_version = 4;
+        glyphs3.note = "A note\nover two lines".to_string();
+        let mut second = glyphs3.features[0].clone();
+        second.code = "# second\n".to_string();
+        second.disabled = true;
+        second.notes = Some("kept".to_string());
+        glyphs3.features.push(second);
+        Font::Glyphs3(glyphs3)
+    }
+
+    #[test]
+    fn glyphs4_package_keeps_kerning_note_and_features_in_their_own_files() {
+        let font = glyphs4_font();
+        let glyphs3 = font.as_glyphs3().unwrap();
+        let written = font.to_package_entries().unwrap();
+
+        assert!(written["kerning.plist"].contains("kerningLTR"));
+        assert_eq!(written["note.md"], glyphs3.note);
+        let fontinfo = &written["fontinfo.plist"];
+        assert!(!fontinfo.contains("kerningLTR"));
+        assert!(!fontinfo.contains("A note"));
+        assert!(!fontinfo.contains("code = "));
+
+        let tag = &glyphs3.features[0].tag;
+        assert_eq!(
+            written[&format!("features/{tag}.fea")],
+            glyphs3.features[0].code
+        );
+        assert_eq!(written[&format!("features/{tag}.2.fea")], "# second\n");
+        let class = &glyphs3.classes[0];
+        assert_eq!(
+            written[&format!("features/@{}.fea", class.name)],
+            class.code
+        );
+
+        // Reading it back gives the same font: order, flags and code. The
+        // entries now name their files, and the family name is a property.
+        let reloaded = Font::load_package_entries(&written.clone().into_iter().collect()).unwrap();
+        let again = reloaded.as_glyphs3().unwrap();
+        assert_eq!(again.family_name, glyphs3.family_name);
+        let without_files = |features: &[Feature]| {
+            features
+                .iter()
+                .cloned()
+                .map(|f| Feature { file: None, ..f })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            without_files(&again.features),
+            without_files(&glyphs3.features)
+        );
+        assert_eq!(
+            again.features.last().unwrap().file.as_deref(),
+            Some(&*format!("{tag}.2.fea"))
+        );
+        assert_eq!(reloaded.to_package_entries().unwrap(), written);
+        // A glyph file is the same as in a Glyphs 3 package.
+        let (path, contents) = font.package_glyph_entry("A").unwrap().unwrap();
+        assert_eq!(written[&path], contents);
+    }
+
+    /// Lines a written file may have that Glyphs writes differently, in
+    /// Glyphs 3 as in Glyphs 4: numeric dictionary keys in quotes, and
+    /// arrays Glyphs puts one element per line written inline.
+    fn known_formatting_gap(line: &str) -> bool {
+        let quoted_number_key = line.starts_with('"')
+            && line[1..]
+                .split('"')
+                .next()
+                .is_some_and(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_digit()));
+        let inline_array = ["axesValues = (", "numberValues = (", "value = ("]
+            .iter()
+            .any(|p| line.starts_with(p))
+            && line.ends_with(");");
+        quoted_number_key || inline_array
+    }
+
+    fn assert_same_but_known_gaps(path: &str, written: &str, original: &str) {
+        let original_lines: HashSet<&str> = original.lines().collect();
+        let extra: Vec<&str> = written
+            .lines()
+            .filter(|l| !original_lines.contains(l) && !known_formatting_gap(l))
+            .collect();
+        assert!(extra.is_empty(), "{path}: unexpected lines {extra:?}");
+    }
+
+    /// A file saved by Glyphs 4 (Fustat, cut down to a few glyphs).
+    #[test]
+    fn glyphs4_file_from_glyphs_round_trips() {
+        let original = fs::read_to_string("resources/FustatG4-subset.glyphs").unwrap();
+        let font = Font::load_str(&original).unwrap();
+        let glyphs3 = font.as_glyphs3().unwrap();
+        assert_eq!(glyphs3.format_version, 4);
+        // Glyphs 4 keeps these names only in properties.
+        assert_eq!(glyphs3.family_name, "Fustat");
+        assert_eq!(glyphs3.instances[0].name, "ExtraLight");
+        assert_eq!(glyphs3.settings.color_space.as_deref(), Some("apple-rgb"));
+
+        let written = font.to_string().unwrap();
+        assert!(!written.contains("\nfamilyName = "));
+        assert!(written.contains("key = familyNames;"));
+        // Block arrays end with a comma after the last element.
+        assert!(written.contains(",\n);"));
+        assert_same_but_known_gaps("FustatG4-subset.glyphs", &written, &original);
+        assert_eq!(Font::load_str(&written).unwrap(), font);
+    }
+
+    #[test]
+    fn glyphs4_package_from_glyphs_round_trips() {
+        let root = path::Path::new("resources/packages/FustatG4.glyphspackage");
+        let original = read_package(root);
+        let font = Font::load_package_entries(&original).unwrap();
+        let glyphs3 = font.as_glyphs3().unwrap();
+        assert_eq!(glyphs3.family_name, "Fustat");
+        let ccmp: Vec<&str> = glyphs3
+            .features
+            .iter()
+            .filter(|f| f.tag == "ccmp")
+            .map(|f| f.code.as_str())
+            .collect();
+        assert_eq!(ccmp.len(), 2);
+        assert_eq!(ccmp[1], original["features/ccmp.2.fea"]);
+
+        let written = font.to_package_entries().unwrap();
+        let paths = |m: &BTreeMap<String, String>| m.keys().cloned().collect::<Vec<_>>();
+        let mut original_paths: Vec<String> = original.keys().cloned().collect();
+        original_paths.sort();
+        assert_eq!(paths(&written), original_paths);
+        for (path, contents) in &written {
+            if path == "fontinfo.plist" || path == "kerning.plist" {
+                assert_same_but_known_gaps(path, contents, &original[path]);
+            } else {
+                assert_eq!(contents, &original[path], "{path} differs");
+            }
+        }
+        let reloaded = Font::load_package_entries(&written.into_iter().collect()).unwrap();
+        assert_eq!(reloaded, font);
+    }
+
+    /// The flat file and the package Glyphs 4 saved of the same font read
+    /// the same, apart from the files the package names for features.
+    #[test]
+    fn glyphs4_file_and_package_read_alike() {
+        let flat = Font::load(path::Path::new("resources/FustatG4-subset.glyphs")).unwrap();
+        let package =
+            Font::load(path::Path::new("resources/packages/FustatG4.glyphspackage")).unwrap();
+        let Font::Glyphs3(mut package) = package else {
+            panic!("not a Glyphs 3 font");
+        };
+        for f in &mut package.features {
+            f.file = None;
+        }
+        for c in &mut package.classes {
+            c.file = None;
+        }
+        for p in &mut package.feature_prefixes {
+            p.file = None;
+        }
+        assert_eq!(&package, flat.as_glyphs3().unwrap());
     }
 }

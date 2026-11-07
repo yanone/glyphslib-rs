@@ -5,7 +5,7 @@ use std::fmt;
 use crate::serde::{deserialize_commify, is_default, serialize_commify};
 use openstep_plist::{Dictionary, Plist};
 use serde::de::{self, SeqAccess, Visitor};
-use serde::ser::{SerializeMap as _, SerializeTuple as _};
+use serde::ser::SerializeTuple as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// The OpenType layout classes of the font (`GSClass`)
@@ -17,10 +17,15 @@ pub struct FeatureClass {
     /// The code of the class.
     ///
     /// Note that this code may not just be a whitespace-separated list of glyph names but may also contain comments and other feature code constructs. Examples: "A B C", "noon-ar noon-ar.fina noon-ar.medi noon-ar.init # noon-ar glyphs".
+    #[serde(default, skip_serializing_if = "code_lives_in_package_file")]
     pub code: String,
     /// Whether the class is disabled.
     #[serde(default, skip_serializing_if = "is_default")]
     pub disabled: bool,
+    /// The `features/*.fea` file that holds the code in a Glyphs 4 package.
+    /// Written only into a package's `fontinfo.plist`.
+    #[serde(default, skip_serializing_if = "file_not_written")]
+    pub file: Option<String>,
     /// The name of the class. The leading at sign (`@`) is not included. Examples: `"Uppercase"`, `"CombiningTopAccents"`.
     pub name: String,
     /// A string serving as a description or comment about the class.
@@ -47,10 +52,15 @@ pub struct FeaturePrefix {
     #[serde(default, skip_serializing_if = "is_default")]
     pub automatic: bool,
     /// The code of the feature prefix. Example: `"languagesystem DFLT dflt;"`.
+    #[serde(default, skip_serializing_if = "code_lives_in_package_file")]
     pub code: String,
     /// Whether the feature prefix is disabled.
     #[serde(default, skip_serializing_if = "is_default")]
     pub disabled: bool,
+    /// The `features/*.fea` file that holds the code in a Glyphs 4 package.
+    /// Written only into a package's `fontinfo.plist`.
+    #[serde(default, skip_serializing_if = "file_not_written")]
+    pub file: Option<String>,
     /// The name of the feature prefix. Example: `"Languagesystems"`.
     #[serde(alias = "tag")] // Of course some random Glyphs version did this
     pub name: String,
@@ -66,10 +76,15 @@ pub struct Feature {
     #[serde(default, skip_serializing_if = "is_default")]
     pub automatic: bool,
     /// The code of the feature. Example: `"sub a by a.alt;"`.
+    #[serde(default, skip_serializing_if = "code_lives_in_package_file")]
     pub code: String,
     /// Whether the feature is disabled.
     #[serde(default, skip_serializing_if = "is_default")]
     pub disabled: bool,
+    /// The `features/*.fea` file that holds the code in a Glyphs 4 package.
+    /// Written only into a package's `fontinfo.plist`.
+    #[serde(default, skip_serializing_if = "file_not_written")]
+    pub file: Option<String>,
     /// The labels of the feature.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<StylisticSetLabel>,
@@ -123,6 +138,47 @@ impl Drop for FormatVersionGuard {
     }
 }
 
+thread_local! {
+    static WRITING_PACKAGE_FEATURE_FILES: Cell<bool> = const { Cell::new(false) };
+}
+
+/// While alive, feature, class and prefix code is left out of serialized
+/// entries, because a Glyphs 4 package keeps it in `features/*.fea` files.
+pub(crate) struct PackageFeatureFilesGuard(bool);
+
+impl PackageFeatureFilesGuard {
+    pub(crate) fn new() -> Self {
+        Self(WRITING_PACKAGE_FEATURE_FILES.with(|cell| cell.replace(true)))
+    }
+}
+
+impl Drop for PackageFeatureFilesGuard {
+    fn drop(&mut self) {
+        WRITING_PACKAGE_FEATURE_FILES.with(|cell| cell.set(self.0));
+    }
+}
+
+#[allow(clippy::ptr_arg)] // serde passes the field as &String
+fn code_lives_in_package_file(_code: &String) -> bool {
+    WRITING_PACKAGE_FEATURE_FILES.with(Cell::get)
+}
+
+fn file_not_written(file: &Option<String>) -> bool {
+    file.is_none() || !WRITING_PACKAGE_FEATURE_FILES.with(Cell::get)
+}
+
+/// Serializes `value` the way the current file format version writes it:
+/// Glyphs 4 ends every element of a block array with a comma.
+pub(crate) fn plist_string<T: Serialize>(
+    value: &T,
+) -> Result<String, openstep_plist::error::Error> {
+    if current_format_version() >= 4 {
+        openstep_plist::ser::to_string_with_trailing_commas(value)
+    } else {
+        openstep_plist::ser::to_string(value)
+    }
+}
+
 pub(crate) fn current_format_version() -> u8 {
     FORMAT_VERSION
         .with(Cell::get)
@@ -166,14 +222,19 @@ impl Serialize for Color {
                 let mut tuple = serializer.serialize_tuple(3)?;
                 tuple.serialize_element("p")?;
                 tuple.serialize_element(index)?;
-                tuple.serialize_element(alpha)?;
+                if current_format_version() >= 4 {
+                    tuple.serialize_element(&round_color_component(*alpha))?;
+                } else {
+                    // Version 3 writes the alpha as an 8-bit factor.
+                    tuple.serialize_element(&((alpha * 255.0).round() as u8))?;
+                }
                 tuple.end()
             }
             Color::ColorTuple(components) => {
                 let mut tuple = serializer.serialize_tuple(components.len())?;
                 if current_format_version() >= 4 {
                     for component in components {
-                        tuple.serialize_element(component)?;
+                        tuple.serialize_element(&round_color_component(*component))?;
                     }
                 } else {
                     for component in components {
@@ -233,7 +294,18 @@ impl<'de> Visitor<'de> for ColorVisitor {
                 let index = seq
                     .next_element()?
                     .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-                let alpha = seq.next_element()?.unwrap_or(1.0);
+                let alpha: f64 = seq
+                    .next_element()?
+                    .unwrap_or(match current_format_version() {
+                        4.. => 1.0,
+                        _ => 255.0,
+                    });
+                // Version 3 writes the alpha as an 8-bit factor.
+                let alpha = if current_format_version() >= 4 {
+                    alpha
+                } else {
+                    alpha / 255.0
+                };
                 Ok(Color::ColorPaletteIndex { index, alpha })
             }
             // A list of color components.
@@ -255,6 +327,11 @@ impl<'de> Visitor<'de> for ColorVisitor {
     }
 }
 
+/// A `0…1` color component as Glyphs 4 writes it, to three decimals.
+pub(crate) fn round_color_component(component: f64) -> f64 {
+    (component * 1000.0).round() / 1000.0
+}
+
 /// First element of a `Color` array: either the `"p"` palette marker or a
 /// numeric color component.
 #[derive(Deserialize)]
@@ -264,17 +341,63 @@ enum ColorElement {
     Number(f64),
 }
 
-/// A dictionary of the arbitrary attributes stored on an object.
+/// The user data and other attributes of an anchor or guide.
 ///
-/// Glyphs 4 stores these under the `attr` key (folding in the object's user
-/// data); Glyphs 3 and earlier store that user data under `userData`. Both are
-/// exposed here as a single dictionary, which is (de)serialized under the key
-/// matching the active file format version. Intended for use with
-/// `#[serde(flatten)]`.
+/// Glyphs 3 writes the user data under `userData` and the other attributes
+/// under `attr`; Glyphs 4 writes the user data inside `attr`, as
+/// `attr = { userData = {...}; }`. See [`AttributesSerde`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Attributes {
-    /// The underlying attribute dictionary.
+    /// The user data.
     pub dict: Dictionary,
+    /// The other attributes.
+    pub other: Dictionary,
+}
+
+/// How [`Attributes`] are written in the current file format version: the
+/// `attr` and `userData` keys of the object.
+pub(crate) struct AttributesSerde {
+    pub attr: Dictionary,
+    pub user_data: Dictionary,
+}
+
+impl From<&Attributes> for AttributesSerde {
+    fn from(attributes: &Attributes) -> Self {
+        let mut attr = attributes.other.clone();
+        if current_format_version() >= 4 {
+            if !attributes.dict.is_empty() {
+                attr.insert(
+                    "userData".into(),
+                    Plist::Dictionary(attributes.dict.clone()),
+                );
+            }
+            AttributesSerde {
+                attr,
+                user_data: Dictionary::new(),
+            }
+        } else {
+            AttributesSerde {
+                attr,
+                user_data: attributes.dict.clone(),
+            }
+        }
+    }
+}
+
+impl From<AttributesSerde> for Attributes {
+    fn from(written: AttributesSerde) -> Self {
+        let mut other = written.attr;
+        let mut dict = match other.remove("userData") {
+            Some(Plist::Dictionary(user_data)) => user_data,
+            Some(value) => {
+                other.insert("userData".into(), value);
+                Dictionary::new()
+            }
+            None => Dictionary::new(),
+        };
+        dict.extend(written.user_data);
+        Attributes { dict, other }
+    }
 }
 
 impl Attributes {
@@ -291,7 +414,10 @@ impl Attributes {
 
 impl From<Dictionary> for Attributes {
     fn from(dict: Dictionary) -> Self {
-        Attributes { dict }
+        Attributes {
+            dict,
+            other: Dictionary::new(),
+        }
     }
 }
 
@@ -306,65 +432,6 @@ impl std::ops::Deref for Attributes {
 impl std::ops::DerefMut for Attributes {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.dict
-    }
-}
-
-impl Serialize for Attributes {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Empty dictionaries are omitted from the file.
-        let key = if current_format_version() >= 4 {
-            "attr"
-        } else {
-            "userData"
-        };
-        let entries = usize::from(!self.dict.is_empty());
-        let mut map = serializer.serialize_map(Some(entries))?;
-        if entries == 1 {
-            map.serialize_entry(key, &self.dict)?;
-        }
-        map.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for Attributes {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(AttributesVisitor)
-    }
-}
-
-struct AttributesVisitor;
-
-impl<'de> Visitor<'de> for AttributesVisitor {
-    type Value = Attributes;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("a dictionary of attributes")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: de::MapAccess<'de>,
-    {
-        let mut dict = Dictionary::new();
-        while let Some(key) = map.next_key::<String>()? {
-            match key.as_str() {
-                // The version 4 key, and the earlier user-data key. Both are
-                // folded into a single dictionary.
-                "attr" | "userData" => {
-                    dict.extend(map.next_value::<Dictionary>()?);
-                }
-                _ => {
-                    let _ = map.next_value::<Plist>()?;
-                }
-            }
-        }
-        Ok(Attributes { dict })
     }
 }
 
@@ -516,4 +583,23 @@ pub struct SmartComponentSetting {
     pub top_value: i32,
     /// The name of the property.
     pub name: String,
+    /// The name of the bottom value (version 3 only; unused).
+    #[serde(
+        default,
+        rename = "bottomName",
+        skip_serializing_if = "not_written_after_version_3"
+    )]
+    pub bottom_name: Option<String>,
+    /// The name of the top value (version 3 only; unused).
+    #[serde(
+        default,
+        rename = "topName",
+        skip_serializing_if = "not_written_after_version_3"
+    )]
+    pub top_name: Option<String>,
+}
+
+/// Version 4 dropped the unused names of smart component values.
+fn not_written_after_version_3(name: &Option<String>) -> bool {
+    name.is_none() || current_format_version() >= 4
 }
